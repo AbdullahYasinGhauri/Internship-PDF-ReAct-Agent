@@ -21,14 +21,15 @@ BACKEND_URL = "http://localhost:8000"
 with st.sidebar:
     st.header("1. Upload PDF")
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-    
-    if uploaded_file and st.session_state.file_id is None:
+
+    if uploaded_file and uploaded_file.name != st.session_state.get("uploaded_filename"):
         with st.spinner("Extracting text from PDF..."):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
             response = httpx.post(f"{BACKEND_URL}/upload", files=files, timeout=30.0)
             if response.status_code == 200:
                 data = response.json()
                 st.session_state.file_id = data["file_id"]
+                st.session_state.uploaded_filename = uploaded_file.name
                 st.success(f"Loaded: {data['filename']} ({data['pages']} pages)")
             else:
                 st.error("Failed to upload PDF.")
@@ -36,36 +37,25 @@ with st.sidebar:
     if st.button("Clear Chat & Memory"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
+        st.session_state.file_id = None
+        st.session_state.uploaded_filename = None
         st.rerun()
 
     st.divider()
     st.caption(f"**Thread ID:** `{st.session_state.thread_id[:8]}...`")
     st.caption(f"**File ID:** `{st.session_state.file_id[:8] if st.session_state.file_id else 'None'}...`")
 
-# --- Helper: Consume SSE Stream ---
-def stream_chat(message: str):
+# --- Helper: Call Chat Endpoint ---
+def get_chat_response(message: str):
     url = f"{BACKEND_URL}/chat"
     payload = {
         "message": message,
         "thread_id": st.session_state.thread_id,
         "file_id": st.session_state.file_id
     }
-    
-    # We use httpx to stream the SSE response
-    with httpx.stream("POST", url, json=payload, timeout=None) as response:
-        buffer = ""
-        for chunk in response.iter_text():
-            buffer += chunk
-            while "\n\n" in buffer:
-                sse_message, buffer = buffer.split("\n\n", 1)
-                for line in sse_message.split("\n"):
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            return
-                        
-                        data = json.loads(data_str)
-                        yield data
+    response = httpx.post(url, json=payload, timeout=60.0)
+    response.raise_for_status()
+    return response.json()["reply"]
 
 # --- Main Chat Interface ---
 # Display chat history
@@ -87,41 +77,20 @@ if prompt := st.chat_input("Ask a question about the PDF..."):
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Stream assistant response
+        # Get assistant response
         with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            thoughts_placeholder = st.empty()
-            
-            full_response = ""
-            thoughts = []
-            current_thought = ""
-            
-            with thoughts_placeholder.container():
-                thought_status = st.status("Agent is thinking...", expanded=True)
+            with st.spinner("Thinking..."):
+                try:
+                    full_response = get_chat_response(prompt)
+                except httpx.HTTPStatusError as e:
+                    full_response = f"Error: {e.response.status_code} - {e.response.text}"
+                except Exception as e:
+                    full_response = f"Error: {str(e)}"
 
-            # Process SSE Stream
-            for data in stream_chat(prompt):
-                if data["type"] == "token":
-                    full_response += data["content"]
-                    message_placeholder.markdown(full_response + "▌")
-                    
-                elif data["type"] == "tool_start":
-                    current_thought = f"🛠️ Calling Tool: **{data['tool']}**\n\nInput: `{data['input']}`"
-                    with thought_status:
-                        st.markdown(current_thought)
-                        
-                elif data["type"] == "tool_end":
-                    current_thought += f"\n\n✅ Tool Output:\n```\n{data['output']}\n```"
-                    with thought_status:
-                        st.markdown(current_thought)
-            
-            # Finalize UI
-            thought_status.update(label="Agent finished reasoning", state="complete", expanded=False)
-            message_placeholder.markdown(full_response)
-            
-            # Save to history
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": full_response,
-                "thoughts": thoughts # (Optional: save thoughts to history if needed)
-            })
+            st.markdown(full_response)
+
+        # Save to history
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_response
+        })

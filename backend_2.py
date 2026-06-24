@@ -6,29 +6,29 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
+from vector_store import store_pdf, search_pdf
 import io
 import json
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv("backend.env")
+chat_history: dict[str, list[dict]] = {}
 
 app = FastAPI(title="PDF ReAct Agent API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # In-memory store (Use Redis/S3 in production)
-pdf_store = {}
+# ignored for now : pdf_store = {}
 
 # --- PDF Tool for the Agent ---
+''' 
 def get_pdf_context(file_id: str | None) -> str:
-    """
-    Return the full PDF text. 
-    Grok-2 supports up to 128k/2M tokens, so passing the whole text is 
-    much more accurate than naive substring searching.
-    """
     if not file_id or file_id not in pdf_store:
         return ""
     return pdf_store[file_id]
+'''
+thread_store = {}
 
 # --- Groq LLM Setup ---
 # Use `GROQ_API_KEY` and `GROQ_API_URL` in backend.env
@@ -42,7 +42,7 @@ class ChatRequest(BaseModel):
     file_id: str | None = None
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), thread_id: str = None):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
@@ -53,8 +53,18 @@ async def upload_pdf(file: UploadFile = File(...)):
         text += page.extract_text() + "\n"
         
     file_id = str(uuid.uuid4())
-    pdf_store[file_id] = text
+
+    store_pdf(file_id, text)
+    if thread_id:
+        thread_store[thread_id] = file_id
     return {"file_id": file_id, "filename": file.filename, "pages": len(reader.pages)}
+
+    @app.get("/thread/{thread_id}")
+    async def get_thread(thread_id: str):
+        return {
+            "file_id": thread_store.get(thread_id),
+            "messages": chat_history.get(thread_id, [])
+        }
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
@@ -67,17 +77,30 @@ async def chat(request: ChatRequest):
     print(f"[DEBUG] API Key prefix: {GROQ_API_KEY[:15]}...")
     print("="*50 + "\n")
     
+    chat_history.setdefault(request.thread_id, []).append({"role": "user", "content": request.message})
+    chat_history[request.thread_id].append({"role": "assistant", "content": text})
+
         # DNS preflight to surface resolution errors clearly
     try:
         host = urlparse(GROQ_API_URL).netloc
-        if host:
-            socket.gethostbyname(host)
+        # if host:
+            # socket.gethostbyname(host)
     except Exception as e:
         print(f"[ERROR] DNS resolution failed for host={host}: {e}")
         raise HTTPException(status_code=502, detail=(f"DNS resolution failed for Groq host '{host}': {e}. "
                                                          "Check GROQ_API_URL in backend.env and network/DNS settings."))
 
-    context = get_pdf_context(request.file_id)
+    file_id = thread_store.get(request.thread_id)
+    if not file_id:
+        return {"reply": "No PDF found for this thread_id. Please upload a PDF first."}
+    context = ""
+
+    if file_id:
+        context = search_pdf(
+            file_id,
+            request.message,
+            k=5
+        )
     
     # Safety truncation for massive PDFs
     if len(context) > 400000:
@@ -128,10 +151,7 @@ async def chat(request: ChatRequest):
             raise HTTPException(status_code=502, detail=f"Network error: {str(e)}")
 
     data = resp.json()
-
-    # Flexible parsing for Groq response shapes
-    data = resp.json()
-
+    
     try:
         text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):

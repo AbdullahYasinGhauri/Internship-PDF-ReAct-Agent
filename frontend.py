@@ -34,6 +34,32 @@ with st.sidebar:
             else:
                 st.error("Failed to upload PDF.")
 
+    st.header("2. Thread Management")
+    new_thread = st.button("➕ New Thread")
+
+    if new_thread:
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.messages = []
+        st.session_state.file_id = None
+        st.rerun()
+
+    st.subheader("Or load existing thread")
+
+    input_thread = st.text_input("Enter Thread ID")
+
+    # Load Thread button
+    if st.button("Load Thread"):
+        try:
+            resp = httpx.get(f"{BACKEND_URL}/thread/{input_thread}", timeout=10.0)
+            resp.raise_for_status()
+            data = resp.json()
+            st.session_state.thread_id = input_thread
+            st.session_state.file_id = data.get("file_id")
+            st.session_state.messages = data.get("messages", [])
+        except Exception as e:
+            st.error(f"Could not load thread: {e}")
+        st.rerun()
+
     if st.button("Clear Chat & Memory"):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
@@ -42,7 +68,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption(f"**Thread ID:** `{st.session_state.thread_id[:8]}...`")
+    st.caption(f"Thread ID: {st.session_state.thread_id}")
     st.caption(f"**File ID:** `{st.session_state.file_id[:8] if st.session_state.file_id else 'None'}...`")
 
 # --- Helper: Call Chat Endpoint ---
@@ -50,10 +76,14 @@ def get_chat_response(message: str):
     url = f"{BACKEND_URL}/chat"
     payload = {
         "message": message,
-        "thread_id": st.session_state.thread_id,
-        "file_id": st.session_state.file_id
+        "thread_id": st.session_state.thread_id
     }
-    response = httpx.post(url, json=payload, timeout=60.0)
+    response = httpx.post(
+        f"{BACKEND_URL}/upload",
+        files=files,
+        data={"thread_id": st.session_state.thread_id},
+        timeout=30.0,
+    )
     response.raise_for_status()
     return response.json()["reply"]
 
